@@ -14,6 +14,8 @@ set(${MODULE_PREFIX}_TESTS
 	TestFreeRDPCodecClear.c
 	TestFreeRDPCodecProgressive.c
 	TestFreeRDPCodecRemoteFX.c)
+include_directories( "../../../include/" )
+include_directories( "../../../winpr/include/" )
 
 create_test_sourcelist(${MODULE_PREFIX}_SRCS
 	${${MODULE_PREFIX}_DRIVER}
@@ -21,7 +23,9 @@ create_test_sourcelist(${MODULE_PREFIX}_SRCS
 
 add_executable(${MODULE_NAME} ${${MODULE_PREFIX}_SRCS})
 
-target_link_libraries(${MODULE_NAME} freerdp winpr)
+find_library( LIB_FREERDP2 freerdp2 PATHS "../../" )
+find_library( LIB_WINPR2 winpr2 PATHS ../../../winpr/libwinpr )
+target_link_libraries(${MODULE_NAME} ${LIB_FREERDP2} $(LIB_WINPR2})
 
 set_target_properties(${MODULE_NAME} PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${TESTING_OUTPUT_DIRECTORY}")
 
