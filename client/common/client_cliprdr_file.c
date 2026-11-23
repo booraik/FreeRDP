@@ -198,9 +198,12 @@ struct cliprdr_file_context
 	UINT32 apple_generation; /* changes with the server clipboard, see apple_lock */
 	HANDLE apple_contents_event;
 	UINT32 apple_stream_id;
+	BOOL apple_contents_arrived;
 	BOOL apple_contents_success;
 	BYTE* apple_contents_data;
 	UINT32 apple_contents_size;
+	UINT32 apple_next_clip_data_id;
+	UINT32 apple_locks[2]; /* the clipDataId of the last two offers, 0 without a lock */
 #endif
 
 	/* File clipping */
@@ -1452,7 +1455,8 @@ static UINT cliprdr_file_context_server_file_contents_response(
 typedef struct
 {
 	CliprdrFileContext* file;
-	UINT32 generation; /* the server clipboard the files are from */
+	UINT32 generation;   /* the server clipboard the files are from */
+	UINT32 clip_data_id; /* locks the files on the server, 0 without a lock */
 	FILEDESCRIPTORW* files;
 	UINT32 count;
 	char** paths; /* the local path of every entry, nullptr if it can not be offered */
@@ -1524,16 +1528,32 @@ fail:
 	return nullptr;
 }
 
-static BOOL apple_request_file_contents(CliprdrFileContext* file, UINT32 generation,
-                                        UINT32 listIndex, UINT32 flags, UINT64 offset, UINT32 size,
-                                        BYTE** pdata, UINT32* plen)
+/* Whether the server still has the files of the offer. Call with apple_lock held. */
+static BOOL apple_offer_valid(const AppleOffer* offer)
 {
-	WINPR_ASSERT(file);
+	WINPR_ASSERT(offer);
+
+	const CliprdrFileContext* file = offer->file;
+	if (file->apple_cancelled)
+		return FALSE;
+	if (offer->clip_data_id != 0)
+		return (file->apple_locks[0] == offer->clip_data_id) ||
+		       (file->apple_locks[1] == offer->clip_data_id);
+	return offer->generation == file->apple_generation;
+}
+
+static BOOL apple_request_file_contents(const AppleOffer* offer, UINT32 listIndex, UINT32 flags,
+                                        UINT64 offset, UINT32 size, BYTE** pdata, UINT32* plen)
+{
+	WINPR_ASSERT(offer);
 	WINPR_ASSERT(pdata);
 	WINPR_ASSERT(plen);
 
 	*pdata = nullptr;
 	*plen = 0;
+
+	CliprdrFileContext* file = offer->file;
+	WINPR_ASSERT(file);
 
 	CLIPRDR_FILE_CONTENTS_REQUEST request = WINPR_C_ARRAY_INIT;
 	request.common.msgType = CB_FILECONTENTS_REQUEST;
@@ -1542,17 +1562,20 @@ static BOOL apple_request_file_contents(CliprdrFileContext* file, UINT32 generat
 	request.nPositionLow = (UINT32)(offset & 0xFFFFFFFF);
 	request.nPositionHigh = (UINT32)(offset >> 32);
 	request.cbRequested = size;
+	request.haveClipDataId = (offer->clip_data_id != 0);
+	request.clipDataId = offer->clip_data_id;
 
 	/* cliprdr_file_context_uninit() cancels under this lock and then waits for the download
 	 * queue, so the channel is valid for as long as this request is not cancelled. */
 	EnterCriticalSection(&file->apple_lock);
-	CliprdrClientContext* cliprdr = file->apple_cancelled ? nullptr : file->context;
-	if (!cliprdr || !cliprdr->ClientFileContentsRequest || (generation != file->apple_generation))
+	CliprdrClientContext* cliprdr = apple_offer_valid(offer) ? file->context : nullptr;
+	if (!cliprdr || !cliprdr->ClientFileContentsRequest)
 	{
 		LeaveCriticalSection(&file->apple_lock);
 		return FALSE;
 	}
 	request.streamId = ++file->apple_stream_id;
+	file->apple_contents_arrived = FALSE;
 	file->apple_contents_success = FALSE;
 	free(file->apple_contents_data);
 	file->apple_contents_data = nullptr;
@@ -1568,24 +1591,38 @@ static BOOL apple_request_file_contents(CliprdrFileContext* file, UINT32 generat
 
 	HANDLE hdl[2] = { freerdp_abort_event(context), file->apple_contents_event };
 	const UINT32 timeout = freerdp_settings_get_uint32(context->settings, FreeRDP_TcpAckTimeout);
-	if (WaitForMultipleObjects(ARRAYSIZE(hdl), hdl, FALSE, timeout) != WAIT_OBJECT_0 + 1)
-	{
-		WLog_Print(file->log, WLOG_ERROR, "no file contents reply for stream %" PRIu32,
-		           request.streamId);
-		return FALSE;
-	}
 
-	EnterCriticalSection(&file->apple_lock);
-	const BOOL rc = file->apple_contents_success && !file->apple_cancelled &&
-	                (generation == file->apple_generation);
-	if (rc)
+	BOOL rc = FALSE;
+	for (BOOL done = FALSE; !done;)
 	{
-		*pdata = file->apple_contents_data;
-		*plen = file->apple_contents_size;
-		file->apple_contents_data = nullptr;
-		file->apple_contents_size = 0;
+		if (WaitForMultipleObjects(ARRAYSIZE(hdl), hdl, FALSE, timeout) != WAIT_OBJECT_0 + 1)
+		{
+			WLog_Print(file->log, WLOG_ERROR, "no file contents reply for stream %" PRIu32,
+			           request.streamId);
+			return FALSE;
+		}
+
+		EnterCriticalSection(&file->apple_lock);
+		const BOOL valid = apple_offer_valid(offer);
+		if (file->apple_contents_arrived || !valid)
+		{
+			done = TRUE;
+			rc = valid && file->apple_contents_arrived && file->apple_contents_success;
+			if (rc)
+			{
+				*pdata = file->apple_contents_data;
+				*plen = file->apple_contents_size;
+				file->apple_contents_data = nullptr;
+				file->apple_contents_size = 0;
+			}
+		}
+		else
+		{
+			/* A clipboard change that does not concern this offer, its files are locked */
+			(void)ResetEvent(file->apple_contents_event);
+		}
+		LeaveCriticalSection(&file->apple_lock);
 	}
-	LeaveCriticalSection(&file->apple_lock);
 	return rc;
 }
 
@@ -1597,8 +1634,85 @@ static void apple_cancel_downloads(CliprdrFileContext* file)
 	EnterCriticalSection(&file->apple_lock);
 	file->apple_cancelled = TRUE;
 	file->apple_generation++;
+	file->apple_locks[0] = 0;
+	file->apple_locks[1] = 0;
 	(void)SetEvent(file->apple_contents_event);
 	LeaveCriticalSection(&file->apple_lock);
+}
+
+/* Ask the server to keep the files of its clipboard, so that they can still be downloaded
+ * after the clipboard changed. \return the clipDataId of the lock, 0 if there is none. */
+static UINT32 apple_lock_server_files(CliprdrFileContext* file)
+{
+	WINPR_ASSERT(file);
+
+	if ((cliprdr_file_context_remote_get_flags(file) & CB_CAN_LOCK_CLIPDATA) == 0)
+		return 0;
+
+	UINT32 id = 0;
+	EnterCriticalSection(&file->apple_lock);
+	CliprdrClientContext* cliprdr = file->apple_cancelled ? nullptr : file->context;
+	if (cliprdr && cliprdr->ClientLockClipboardData)
+	{
+		id = ++file->apple_next_clip_data_id;
+		if (id == 0)
+			id = ++file->apple_next_clip_data_id;
+	}
+	LeaveCriticalSection(&file->apple_lock);
+	if (id == 0)
+		return 0;
+
+	CLIPRDR_LOCK_CLIPBOARD_DATA lock = WINPR_C_ARRAY_INIT;
+	lock.common.msgType = CB_LOCK_CLIPDATA;
+	lock.clipDataId = id;
+	if (cliprdr->ClientLockClipboardData(cliprdr, &lock) != CHANNEL_RC_OK)
+		return 0;
+	return id;
+}
+
+static void apple_unlock_server_files(CliprdrFileContext* file, UINT32 id)
+{
+	WINPR_ASSERT(file);
+
+	if (id == 0)
+		return;
+
+	EnterCriticalSection(&file->apple_lock);
+	CliprdrClientContext* cliprdr = file->apple_cancelled ? nullptr : file->context;
+	LeaveCriticalSection(&file->apple_lock);
+	if (!cliprdr || !cliprdr->ClientUnlockClipboardData)
+		return;
+
+	CLIPRDR_UNLOCK_CLIPBOARD_DATA unlock = WINPR_C_ARRAY_INIT;
+	unlock.common.msgType = CB_UNLOCK_CLIPDATA;
+	unlock.clipDataId = id;
+	(void)cliprdr->ClientUnlockClipboardData(cliprdr, &unlock);
+}
+
+/* Keep the lock for an offer and release the one of the offer before the previous one: the
+ * locks of the last two offers are kept, like their files.
+ * \return FALSE if the server clipboard changed since \b generation was taken: the lock might
+ * hold the files of another copy then and is released. */
+static BOOL apple_keep_lock(CliprdrFileContext* file, UINT32 generation, UINT32 id)
+{
+	WINPR_ASSERT(file);
+
+	if (id == 0)
+		return FALSE;
+
+	UINT32 release = id;
+	EnterCriticalSection(&file->apple_lock);
+	const BOOL keep = !file->apple_cancelled && (generation == file->apple_generation);
+	if (keep)
+	{
+		release = file->apple_locks[1];
+		file->apple_locks[1] = file->apple_locks[0];
+		file->apple_locks[0] = id;
+	}
+	LeaveCriticalSection(&file->apple_lock);
+
+	apple_unlock_server_files(file, release);
+	return keep;
 }
 
 static UINT
@@ -1635,18 +1749,22 @@ cliprdr_file_context_apple_contents_response(CliprdrClientContext* cliprdr_conte
 		else
 			success = FALSE;
 	}
+	file->apple_contents_arrived = TRUE;
 	file->apple_contents_success = success;
 	(void)SetEvent(file->apple_contents_event);
 	LeaveCriticalSection(&file->apple_lock);
 	return CHANNEL_RC_OK;
 }
 
-static BOOL apple_download_file(CliprdrFileContext* file, UINT32 generation, UINT32 listIndex,
+static BOOL apple_download_file(const AppleOffer* offer, UINT32 listIndex,
                                 const FILEDESCRIPTORW* descriptor, const char* path)
 {
-	WINPR_ASSERT(file);
+	WINPR_ASSERT(offer);
 	WINPR_ASSERT(descriptor);
 	WINPR_ASSERT(path);
+
+	CliprdrFileContext* file = offer->file;
+	WINPR_ASSERT(file);
 
 	UINT64 size = 0;
 	if (descriptor->dwFlags & FD_FILESIZE)
@@ -1655,8 +1773,8 @@ static BOOL apple_download_file(CliprdrFileContext* file, UINT32 generation, UIN
 	{
 		BYTE* data = nullptr;
 		UINT32 len = 0;
-		const BOOL rc = apple_request_file_contents(file, generation, listIndex, FILECONTENTS_SIZE,
-		                                            0, sizeof(UINT64), &data, &len);
+		const BOOL rc = apple_request_file_contents(offer, listIndex, FILECONTENTS_SIZE, 0,
+		                                            sizeof(UINT64), &data, &len);
 		if (rc && (len >= sizeof(UINT64)))
 			memcpy(&size, data, sizeof(size));
 		free(data);
@@ -1675,8 +1793,8 @@ static BOOL apple_download_file(CliprdrFileContext* file, UINT32 generation, UIN
 		const UINT32 requested = (size - offset < chunk) ? (UINT32)(size - offset) : chunk;
 		BYTE* data = nullptr;
 		UINT32 len = 0;
-		if (!apple_request_file_contents(file, generation, listIndex, FILECONTENTS_RANGE, offset,
-		                                 requested, &data, &len) ||
+		if (!apple_request_file_contents(offer, listIndex, FILECONTENTS_RANGE, offset, requested,
+		                                 &data, &len) ||
 		    (len == 0) || (len > requested) || (fwrite(data, 1, len, fp) != len))
 		{
 			free(data);
@@ -1715,7 +1833,7 @@ static BOOL apple_download_entry(AppleOffer* offer, UINT32 x)
 	if (offer->done[x])
 		return TRUE;
 
-	if (!apple_download_file(offer->file, offer->generation, x, &offer->files[x], offer->paths[x]))
+	if (!apple_download_file(offer, x, &offer->files[x], offer->paths[x]))
 	{
 		WLog_Print(offer->file->log, WLOG_ERROR, "failed to download %s", offer->paths[x]);
 		(void)winpr_DeleteFile(offer->paths[x]);
@@ -1844,15 +1962,19 @@ fail:
 }
 
 /* Put the server files on the pasteboard, the pasteboard part takes the offer */
-static BOOL apple_offer_server_files(CliprdrFileContext* file, UINT32 generation, const void* data,
-                                     size_t size, const char** mime_types, size_t mime_count,
-                                     cliprdr_file_context_data_fkt fkt, void* userdata)
+static BOOL apple_offer_server_files(CliprdrFileContext* file, UINT32 generation, UINT32 lockId,
+                                     const void* data, size_t size, const char** mime_types,
+                                     size_t mime_count, cliprdr_file_context_data_fkt fkt,
+                                     void* userdata)
 {
 	WINPR_ASSERT(file);
 
 	char* dir = cliprdr_file_apple_new_download_dir();
 	if (!dir)
+	{
+		apple_unlock_server_files(file, lockId);
 		return FALSE;
+	}
 
 	BOOL rc = FALSE;
 	BOOL taken = FALSE;
@@ -1885,6 +2007,10 @@ static BOOL apple_offer_server_files(CliprdrFileContext* file, UINT32 generation
 
 	WLog_Print(file->log, WLOG_DEBUG, "offering %" PRIuz " server files (%" PRIu32 " entries)",
 	           top_level_count, offer->count);
+	if (apple_keep_lock(file, generation, lockId))
+		offer->clip_data_id = lockId;
+	lockId = 0;
+
 	taken = TRUE;
 	rc = cliprdr_file_apple_offer(dir, (const char**)offer->paths, present, offer->count, top_level,
 	                              top_level_count, apple_download, apple_offer_free, offer,
@@ -1894,6 +2020,7 @@ static BOOL apple_offer_server_files(CliprdrFileContext* file, UINT32 generation
 fail:
 	if (!taken)
 		(void)winpr_RemoveDirectory_RecursiveA(dir);
+	apple_unlock_server_files(file, lockId);
 	apple_offer_free(offer);
 	free(top_level);
 	free(present);
@@ -3283,13 +3410,21 @@ BOOL cliprdr_file_context_set_local_clipboard_data(CliprdrFileContext* file,
 	const UINT32 generation = file->apple_generation;
 	LeaveCriticalSection(&file->apple_lock);
 
+	/* Requested before the file list: a clipboard change the server made before it took the
+	 * lock is announced before it sends the list, and changes the generation by then */
+	const UINT32 lockId = apple_lock_server_files(file);
+
 	/* Only the file list is fetched now, the contents follow when the files are read */
 	size_t size = 0;
 	const void* data = fkt(userdata, "FileGroupDescriptorW", &size);
 	if (!data)
+	{
+		apple_unlock_server_files(file, lockId);
 		return FALSE;
+	}
 
-	return apple_offer_server_files(file, generation, data, size, mime_types, count, fkt, userdata);
+	return apple_offer_server_files(file, generation, lockId, data, size, mime_types, count, fkt,
+	                                userdata);
 #else
 	WINPR_UNUSED(file);
 	WINPR_UNUSED(fkt);
